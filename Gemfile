@@ -1,12 +1,7 @@
-# A sample Gemfile
 source "https://rubygems.org"
 
-#gem "signet"
-
-gem "icalendar"
-gem "tzinfo"
-
-gem "base32"
-
+gem 'icalendar'
+gem 'tzinfo'
 gem 'google-api-client'
+gem 'base32'
 

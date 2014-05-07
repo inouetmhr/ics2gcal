@@ -3,33 +3,41 @@
 #
 # Takes a .ics file as parameter, adds it to Google Calendar
 #
-# Change USERNAME and PASSWORD to your username and password, respectively,
-# set DEFAULT_CAL to define the calendar selected by default (you'll still
-# get the option to choose one).
-#
-# (C) 2009 David Verhasselt (david@crowdway.com)
 # (C) 2014 INOUE Tomohiro
 #
 # Licensed under MIT License, see included file LICENSE
 
-#p ENV["LANG"] 
-
-CalendarName = "仕事用"
+### 個人毎にカスタマイズが必要
+# 同期先 Google Calendar のカレンダー名
+CalendarName = "仕事用" 
+# ics ファイルで除外するカテゴリのリスト
+ExcludeCategories = [ "祝日" ] 
 
 require 'date'
-
-require 'bundler'
-Bundler.require
-
-require 'icalendar/tzinfo'
+require 'json'
+require 'logger'
 
 require 'rubygems'
+require 'bundler/setup'
+
+require 'icalendar'
+require 'icalendar/tzinfo'
+require 'base32'
 require 'google/api_client'
 require 'google/api_client/client_secrets'
 require 'google/api_client/auth/file_storage'
 require 'google/api_client/auth/installed_app'
 require 'logger'
-require 'json'
+
+logger = Logger.new(STDOUT)
+logger.level = Logger::INFO
+
+logger.debug("Created logger")
+logger.info("Program started")
+
+logger.debug ENV["http_proxy"] 
+logger.debug ENV["https_proxy"] 
+logger.debug ENV["LANG"] 
 
 ### util functions
 def datetime_hash(datetime, timezone)
@@ -45,7 +53,7 @@ def datetime_hash(datetime, timezone)
 end 
 
 if ARGV.length < 1
-  puts "Need at least 1 .ics file"
+  abort "Need at least 1 .ics file"
   exit
 end
 
@@ -55,19 +63,21 @@ icalendars = Icalendar::parse(ics_file)
 
 TimeZone = 'Asia/Tokyo'
 
-# customize for compat to GCalendar (RFC2938)
+# customize Base32 for compat to GCalendar (RFC2938)
 Base32.table = 'abcdefghijklmnopqrstuv0123456789'.freeze
 
 # convert ics events to GCalendar events
 @events = {}
 icalendars.first.events.each do |event|
+  logger.debug(event)
   gcevent_id = Base32.encode(event.uid).gsub(%r|=+|,'').downcase
 
   gcevent = {}
-  gcevent["id"]      = gcevent_id
-  gcevent["summary"] = event.summary
-  gcevent["start"]   = datetime_hash(event.dtstart, TimeZone)
-  gcevent["end"]     = datetime_hash(event.dtend, TimeZone)
+  gcevent["id"]       = gcevent_id
+  gcevent["summary"]  = event.summary
+  gcevent["start"]    = datetime_hash(event.dtstart, TimeZone)
+  gcevent["end"]      = datetime_hash(event.dtend, TimeZone)
+  gcevent["categories"] = event.categories.to_a
 
   @events[gcevent_id] = gcevent
 end
@@ -103,23 +113,22 @@ end
 # Initialize Google API. Note this will make a request to the
 # discovery service every time, so be sure to use serialization
 # in your production code. Check the samples for more details.
-#plus = client.discovered_api('plus')
 service = client.discovered_api('calendar', 'v3')
 
 #カレンダーリストの取得
-calendars = client.execute(:api_method => service.calendar_list.list)
+gcalendars = client.execute(:api_method => service.calendar_list.list)
 
 @cal_id = nil
-calendars.data.items.each do |c|
-  #puts c["id"];
+gcalendars.data.items.each do |c|
+  logger.debug c["id"]
   if c["summary"] == CalendarName
     @cal_id = c["id"]
     break
   end
 end
 
-puts("cant find calendar") if @cal_id.nil?
-#puts @cal_id
+abort("cant find calendar") if @cal_id.nil?
+logger.debug @cal_id
 
 # Google Calendar 登録済みイベントのスキャン
 day_from = DateTime.now - 365 # 一年前から
@@ -127,11 +136,9 @@ day_to   = DateTime.now + 365 # 一年後まで
 
 params = {}
 params['calendarId'] = @cal_id
-#params['timeMin'] = Time.utc(today.year, today.month, today.day, 0).iso8601
-#params['timeMax'] = Time.utc(today31.year, today31.month, today31.day,0).iso8601
 params['timeMin'] = day_from.iso8601
 params['timeMax'] = day_to.iso8601
-#p params
+logger.debug params
 
 # Page loop...
 gcevents = client.execute(:api_method => service.events.list,:parameters => params)
@@ -143,21 +150,21 @@ while true
     # ics にあるイベントは更新、無いイベントは削除
     gcevent = @events[gcevent_id]
     if gcevent then
-      puts "Updating #{gcevent_summary}..."
+      logger.info "Updating #{gcevent_summary}..."
       result2 = client.execute(:api_method => service.events.patch,
                                :parameters => {'calendarId' => @cal_id, 
                                  'eventId' => gcevent_id},
                                :body => JSON.dump(gcevent),
                                :headers => {'Content-Type' => 'application/json'})
       if JSON.parse(result2.response.body).has_key?("error") then
-        puts result2.response.body
+        logger.info result2.response.body
       end
     else # ics に無いイベントは削除
-      puts "Deleting #{gcevent_summary}..."
+      logger.info "Deleting #{gcevent_summary}..."
       client.execute(:api_method => service.events.delete,
                      :parameters => {'calendarId' => @cal_id, 'eventId' => gcevent_id})
     end
-    #処理済みイベントを後で追加しないように削除
+    #処理済みイベントをメモリから削除（後で追加しないように）
     @events.delete(gcevent_id)
   end
   if !(page_token = gcevents.data.next_page_token)
@@ -169,13 +176,19 @@ end
 
 # Google Calendar に無かったイベントを追加
 @events.each do |gcevent_id, gcevent|
-  #p gcevent_id, gcevent ; next
+  logger.debug gcevent_id
+  logger.debug gcevent
 
   date = gcevent["start"]["dateTime"] || gcevent["start"]["date"]
-  puts 
-  puts "Adding..."
-  #puts "\t#{gcevent_id}"
-  puts "\t#{gcevent["summary"]} on #{date}"
+  logger.debug "\n"
+  logger.info "Adding event ... "
+  logger.debug gcevent_id
+  logger.info "#{gcevent["summary"]} on #{date}"
+  
+  if gcevent["categories"] & ExcludeCategories != []  # 積集合が空じゃない
+    logger.info "skipped (reason: excluded category)"
+    next
+  end
 
   result = client.execute(:api_method => service.events.insert,
                           :parameters => {'calendarId' => @cal_id},
@@ -184,10 +197,11 @@ end
 
   result_hash = JSON.parse(result.response.body)
   if result_hash.has_key?("error") then
-    #puts "dup" if (result_hash["error"]["errors"].first["reason"] == "duplicate") 
-    puts result.response.body
-    #p result.request
+    #logger.debug "event duplicated" if (result_hash["error"]["errors"].first["reason"] == "duplicate") 
+    logger.warn("Event add failed.")
+    logger.warn(result.response.body)
+    logger.debug result.request
   end
 end
 
-puts "End."
+logger.info "Program end."
