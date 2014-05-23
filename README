@@ -34,10 +34,10 @@ export http_proxy=http://your-proxy-ip:port
 export https_proxy=$http_proxy
 export LANG=ja_JP.UTF-8
 
-cd /Users/inoue/Dropbox/Software/ics2gcal/
+cd /Users/username/ics2gcal
 
 /usr/bin/ruby -EUTF-8:UTF-8 \
-    /Users/inoue/Dropbox/Software/ics2gcal/ics2gcal.rb \
+    /Users/username/ics2gcal/ics2gcal.rb \
     -g work -x Holiday,Confidential \
-    /Users/username/icalendar.ics
+    /Users/username/ics2gcal/icalendar.ics
 
