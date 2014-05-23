@@ -34,16 +34,25 @@ require 'google/api_client/client_secrets'
 require 'google/api_client/auth/file_storage'
 require 'google/api_client/auth/installed_app'
 
+@logger = Logger.new(STDOUT)
+@logger.level = Logger::INFO
+#@logger.level = Logger::DEBUG
+@logger.level = Logger::DEBUG if $DEBUG
+@logger.debug("Created logger")
+
 # 
 # Default dispalay name of Google Calendar to be synchronized
 @calendarName ||= "仕事用" 
 # List of categories that are excluded 
 @excludeCategories ||= [ "祝日" ] 
 opt = OptionParser.new
-opt.on('-g CALENDAR', 'Name of Google Calendar to be sync') {|v| @calendarName = v }
-opt.on('-x CATEGORIES', 'Comma seperated list of categories to be excluded for sync'){|v| 
+opt.on('-g CALENDAR', 'Name of Google Calendar to be synchronized') {|v| 
+  @calendarName = v 
+}
+opt.on('-x CATEGORIES', 'Comma seperated list of categories that will not be sync'){|v| 
   @excludeCategories = v.split(',')
 }
+opt.on('-V', 'puts verbose log messages'){|v| @logger.level = Logger::DEBUG}
 
 opt.parse!(ARGV)
 #p @calendarName, @excludeCategories, ARGV
@@ -52,15 +61,7 @@ if ARGV.length < 1
   abort "Need one .ics file in argments"
 end
 
-
-@logger = Logger.new(STDOUT)
-@logger.level = Logger::INFO
-#@logger.level = Logger::DEBUG
-@logger.level = Logger::DEBUG if $DEBUG
-
-@logger.debug("Created logger")
 @logger.info("Program started")
-
 @logger.debug ENV["http_proxy"] 
 @logger.debug ENV["https_proxy"] 
 @logger.debug ENV["LANG"] 

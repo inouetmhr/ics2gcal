@@ -1,0 +1,43 @@
+One way sync tool from iCalendar (ics file) to Google Calendar.
+Takes a .ics file as parameter, adds it to Google Calendar.
+
+Calendar properties to be synchronized:
+       - Event summary (title)
+       - Event date/time (start and end)
+       
+CURRENTLY, ONLY JST (JAPN) TIME ZONE is supported. 
+(because of a hard-coded hack to fix timezone problem with iCalendar library)
+
+Prerequisite:
+1. Setup your Google Developer API 
+   https://console.developers.google.com/
+2. Setup your OAuth credentials for this script
+   https://developers.google.com/google-apps/calendar/firstapp
+   - create your client id and secret for native applications
+   - download client_secret (json file) 
+   - put it to the same folder of the script
+3. Run the script
+   (First time, you will see OAuth consent screen on your browser)
+
+Usage: ics2gcal [options] ics_file
+    -g CALENDAR      Name of Google Calendar to be synchronized
+    -x CATEGORIES    Comma seperated list of categories that will not be sync
+
+
+
+Sample shell script to run with launchd or cron:
+
+#!/bin/sh
+# -*- coding: utf-8 -*-
+
+export http_proxy=http://your-proxy-ip:port
+export https_proxy=$http_proxy
+export LANG=ja_JP.UTF-8
+
+cd /Users/inoue/Dropbox/Software/ics2gcal/
+
+/usr/bin/ruby -EUTF-8:UTF-8 \
+    /Users/inoue/Dropbox/Software/ics2gcal/ics2gcal.rb \
+    -g work -x Holiday,Confidential \
+    /Users/username/icalendar.ics
+
