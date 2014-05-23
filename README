@@ -5,7 +5,7 @@ Calendar properties to be synchronized:
        - Event summary (title)
        - Event date/time (start and end)
        
-CURRENTLY, ONLY JST (JAPN) TIME ZONE is supported. 
+CURRENTLY, ONLY JST (JAPAN) TIME ZONE is supported. 
 (because of a hard-coded hack to fix timezone problem with iCalendar library)
 
 Prerequisite:
