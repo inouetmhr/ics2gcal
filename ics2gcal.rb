@@ -86,8 +86,43 @@ class Icalendar::Values::DateTime
   def fix_JST  # minus 9 hours 
     return (self - Rational(9,24)).new_offset("+0900")
   end
+
+  def fix_offset(offset)  # offset: e.g. Rational(9,24) 
+    return (self - offset).new_offset(offset)
+  end
 end
 
+class Icalendar::Event
+  def fix_timezone!
+    tzids = @dtstart.ical_params["tzid"]
+    return unless tzids # UTC の場合? 未検証
+
+    #FIXME tzids が複数の場合未検証
+    tzid = tzids.first
+    standard = @parent.timezone_info(tzid)
+    if standard then
+      offset = Rational(standard.hours,24)
+      @dtstart = @dtstart.fix_offset(offset)
+      @dtend   = @dtend.fix_offset(offset)
+    else
+      Icalendar.logger.warn "TZID #{tzid} not processed" 
+    end
+    return self
+  end
+end
+
+class Icalendar::Calendar
+  def timezone_info(tzid)
+    @timezones.each{|tz|
+      next unless tz.tzid == tzid
+
+      #FIXME これでいいのかよくわからんし、PST8 などで動くか未検証
+      return tz.standards.first.tzoffsetto
+    }
+    return nil
+  end
+end
+            
 # def fix_JST(datetime)
 #   return nil if datetime.kind_of?(DateTime)
 #   case datetime.zone
@@ -167,14 +202,14 @@ icalendars.first.events.each do |ievent|
     next
   end
 
-  # 繰り返しで無い場合、iCalendar の tzid を正しく読まないので修正
+  # iCalendar の tzid を正しく読まないので、終日イベント以外は修正
   if ievent.dtstart.instance_of?(Icalendar::Values::DateTime)
-    gevent["start"]   = datetime_hash(ievent.dtstart.fix_JST, TimeZone)
-    gevent["end"]     = datetime_hash(ievent.dtend.fix_JST, TimeZone)
-  else 
-    gevent["start"]   = datetime_hash(ievent.dtstart, TimeZone)
-    gevent["end"]     = datetime_hash(ievent.dtend, TimeZone)
+    ievent.fix_timezone!
   end
+  # TODO Google に TimeZone 渡さないといけないんだっけ? （そうだった気がするけど）
+  gevent["start"]   = datetime_hash(ievent.dtstart, TimeZone)
+  gevent["end"]     = datetime_hash(ievent.dtend, TimeZone)
+
   @events[gevent_id] = gevent
 
   @logger.debug ievent.summary
@@ -261,6 +296,7 @@ while true
                                :headers => {'Content-Type' => 'application/json'})
       if JSON.parse(result2.response.body).has_key?("error") then
         @logger.info result2.response.body
+        @logger.debug result2.request.body
       end
     else # gc と ics で id が一致しないイベントは、ケースに応じて処理
       if gevent['recurringEventId'] then
