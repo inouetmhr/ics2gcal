@@ -5,8 +5,7 @@ Calendar properties to be synchronized:
        - Event summary (title)
        - Event date/time (start and end)
        
-CURRENTLY, ONLY JST (JAPAN) TIME ZONE is supported. 
-(because of a hard-coded hack to fix timezone problem with iCalendar library)
+This version supports timezone, but tested only in TZ=JST-9 (Japan) .
 
 Prerequisite:
 1. Setup your Google Developer API 
