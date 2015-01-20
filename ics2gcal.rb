@@ -117,6 +117,8 @@ class Icalendar::Calendar
                      utc_offset.seconds
     offset_seconds = - offset_seconds if utc_offset.behind 
     Rational(offset_seconds, 24 * 60 * 60 )
+  rescue
+    nil
   end
 
   # return timezone offset: e.g. JST-9 => Rational(9/24)
