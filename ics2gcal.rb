@@ -80,8 +80,8 @@ def get_date(gevent)
   return date["dateTime"] || date["date"]
 end
 
-# iCalendar library (GEM) seems not read tzid (time zone) in ics file
-# This hack returns a modified datetime as JST time zone was set
+# To fix timezone:
+# iCalendar gem library ignores tzid (time zone) on parsing ics_file
 class Icalendar::Values::DateTime
   def fix_JST  # minus 9 hours 
     return (self - Rational(9,24)).new_offset("+0900")
@@ -99,9 +99,8 @@ class Icalendar::Event
 
     #FIXME tzids が複数の場合未検証
     tzid = tzids.first
-    standard = @parent.timezone_info(tzid)
-    if standard then
-      offset = Rational(standard.hours,24)
+    offset = @parent.timezone_offset(tzid)
+    if offset then
       @dtstart = @dtstart.fix_offset(offset)
       @dtend   = @dtend.fix_offset(offset)
     else
@@ -112,26 +111,26 @@ class Icalendar::Event
 end
 
 class Icalendar::Calendar
-  def timezone_info(tzid)
+  def utc_offset_to_rational(utc_offset)
+    offset_seconds = utc_offset.hours * 60 * 60 + \
+                     utc_offset.minutes * 60 + \
+                     utc_offset.seconds
+    offset_seconds = - offset_seconds if utc_offset.behind 
+    Rational(offset_seconds, 24 * 60 * 60 )
+  end
+
+  # return timezone offset: e.g. JST-9 => Rational(9/24)
+  def timezone_offset(tzid)
     @timezones.each{|tz|
       next unless tz.tzid == tzid
 
-      #FIXME これでいいのかよくわからんし、PST8 などで動くか未検証
-      return tz.standards.first.tzoffsetto
+      #FIXME standards.first.tzoffsetto が妥当なのか不明
+      # daylight (夏時間?) ありだとだめかも
+      return utc_offset_to_rational(tz.standards.first.tzoffsetto)
     }
     return nil
   end
 end
-            
-# def fix_JST(datetime)
-#   return nil if datetime.kind_of?(DateTime)
-#   case datetime.zone
-#   when "+00:00"
-#     return (datetime - Rational(9,24)).new_offset("+0900")
-#   else
-#     return datetime
-#   end
-# end
 
 # convert Date/DateTime object to a Hash object that represents date/time
 def datetime_hash(datetime, timezone)
@@ -202,7 +201,8 @@ icalendars.first.events.each do |ievent|
     next
   end
 
-  # iCalendar の tzid を正しく読まないので、終日イベント以外は修正
+  # icsファイルの tzid を正しく読まないので、終日イベント以外は修正
+  # 繰り返しのイベントはなぜ修正しなくてよいの???
   if ievent.dtstart.instance_of?(Icalendar::Values::DateTime)
     ievent.fix_timezone!
   end
@@ -296,7 +296,7 @@ while true
                                :headers => {'Content-Type' => 'application/json'})
       if JSON.parse(result2.response.body).has_key?("error") then
         @logger.info result2.response.body
-        @logger.debug result2.request.body
+        @logger.warn result2.request.body
       end
     else # gc と ics で id が一致しないイベントは、ケースに応じて処理
       if gevent['recurringEventId'] then
