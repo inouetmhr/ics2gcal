@@ -13,7 +13,7 @@
 #  - ievent : an instance of iCalendar event (including recurring event)
 #  - ievent_ex : an exception (a modified instance) of recurring evnent
 #  - gevent : an instance of Google calendar event (including recurring event)
-#  - gitem  : each event item of a Google calendar recurring event
+#  - gitem  : each event item of Google calendar's recurring event
 # +++
 
 require 'date'
@@ -224,10 +224,10 @@ end
 #TODO bulk update
 
 # Initialize the client.
-client = Google::APIClient.new(
-                               :application_name => 'ICS to Google Calendar',
-                               :application_version => '0.1.0'
-                               )
+@client = Google::APIClient.new(
+  :application_name => 'ICS to Google Calendar',
+  :application_version => '0.1.0'
+)
 
 # OAuth2.0 auth and  cache 
 CREDENTIAL_STORE_FILE = "#{$0}-oauth2.json"
@@ -242,19 +242,19 @@ if file_storage.authorization.nil?
                                                  :scope => ['https://www.googleapis.com/auth/calendar']
                                                  )
   
-  client.authorization = flow.authorize(file_storage)
+  @client.authorization = flow.authorize(file_storage)
 else
-  client.authorization = file_storage.authorization
+  @client.authorization = file_storage.authorization
 end
 
 
 # Initialize Google API. Note this will make a request to the
 # discovery service every time, so be sure to use serialization
 # in your production code. Check the samples for more details.
-service = client.discovered_api('calendar', 'v3')
+@service = @client.discovered_api('calendar', 'v3')
 
 #カレンダーリストの取得
-gcalendars = client.execute(:api_method => service.calendar_list.list)
+gcalendars = @client.execute(:api_method => @service.calendar_list.list)
 
 @cal_id = nil
 gcalendars.data.items.each do |c|
@@ -278,8 +278,25 @@ params['timeMin'] = day_from.iso8601
 params['timeMax'] = day_to.iso8601
 @logger.debug params
 
+def gc_update(gevent, ievent)
+  #GCカレンダーアイテムの更新
+  gevent_id = gevent['id']
+  gevent_summary = gevent["summary"]
+  @logger.info "Updating #{gevent_summary} on #{get_date(gevent)}"
+  
+  result2 = @client.execute(:api_method => @service.events.patch,
+                            :parameters => {'calendarId' => @cal_id, 
+                                           'eventId' => gevent_id},
+                            :body => JSON.dump(ievent),
+                            :headers => {'Content-Type' => 'application/json'})
+  if JSON.parse(result2.response.body).has_key?("error") then
+    @logger.info result2.response.body
+    @logger.warn result2.request.body
+  end
+end
+
 # GCイベントをスキャン with Pagerization
-gevents = client.execute(:api_method => service.events.list,:parameters => params)
+gevents = @client.execute(:api_method => @service.events.list,:parameters => params)
 while true
   gevents.data.items.each do |gevent|
     #gevent_id = gevent['iCalUID']
@@ -288,19 +305,12 @@ while true
     gevent_summary = gevent["summary"]
 
     ievent = @events[gevent_id]
-    # gc の id が ics のid と一致したイベントは、更新する
     if ievent then
-      @logger.info "Updating #{gevent_summary} on #{get_date(gevent)}"
-      result2 = client.execute(:api_method => service.events.patch,
-                               :parameters => {'calendarId' => @cal_id, 
-                                 'eventId' => gevent_id},
-                               :body => JSON.dump(ievent),
-                               :headers => {'Content-Type' => 'application/json'})
-      if JSON.parse(result2.response.body).has_key?("error") then
-        @logger.info result2.response.body
-        @logger.warn result2.request.body
-      end
-    else # gc と ics で id が一致しないイベントは、ケースに応じて処理
+      # gc の id が ics のid と一致したイベントは、更新する
+      # 現状、全部更新してる
+      gc_update(gevent, ievent)
+    else # gc と ics で id が一致しない（icsに無い）イベントはケースに応じて処理
+      @logger.warn gevent
       if gevent['recurringEventId'] then
         # 繰り返しイベントのインスタンスの場合はスキップ
         @logger.info "Skipping Recurring event on #{get_date(gevent)} ..."
@@ -308,7 +318,7 @@ while true
         # そうでない場合は、icsから削除されたイベントか、別IDで登録さ
         # れた例外イベントなので、削除する（変更は追加で対応）
         @logger.info "Deleting #{gevent_summary} on #{get_date(gevent)} ..."
-        client.execute(:api_method => service.events.delete,
+        @client.execute(:api_method => @service.events.delete,
                        :parameters => {'calendarId' => @cal_id, 'eventId' => gevent_id})
       end
     end
@@ -319,7 +329,7 @@ while true
     break
   end
   params["pageToken"] = page_token
-  gevents = client.execute(:api_method => service.events.list,:parameters => params)
+  gevents = @client.execute(:api_method => @service.events.list,:parameters => params)
 end
 
 # Google Calendar に無かったイベントを追加
@@ -337,17 +347,29 @@ end
     next
   end
 
-  result = client.execute(:api_method => service.events.insert,
+  result = @client.execute(:api_method => @service.events.insert,
                           :parameters => {'calendarId' => @cal_id},
                           :body => JSON.dump(gevent),
                           :headers => {'Content-Type' => 'application/json'})
 
   result_hash = JSON.parse(result.response.body)
   if result_hash.has_key?("error") then
-    #@logger.debug "event duplicated" if (result_hash["error"]["errors"].first["reason"] == "duplicate") 
-    @logger.warn("Event add failed.")
-    @logger.warn(result.response.body)
-    @logger.debug result.request
+    if (result_hash["error"]["errors"].first["reason"] == "duplicate") then
+      # なんらかの理由で、イベントは削除されたが gc の id が残っている状態の場合
+      @logger.warn "event duplicated (id = #{gevent_id})"
+      @logger.debug gevent
+      # gc_update(gevent, gevent) #これだと更新は成功するが削除状態のままになる
+
+      # しかたないので id を空にして新規追加する
+      # TODO: これだと次回実行時にまた削除されて毎回追加になる
+      gevent.delete("id")
+      @logger.warn "Retry adding with null id"
+      redo
+    else
+      @logger.warn("Event add failed.")
+      @logger.warn(result.response.body)
+      @logger.debug result.request
+    end
   end
 end
 
@@ -366,7 +388,7 @@ end
   
   #gc 個別イベント (gitem) のスキャン
   #これには例外だけで無く全てのイベントインスタンスが含まれる
-  result = client.execute(:api_method => service.events.instances,
+  result = @client.execute(:api_method => @service.events.instances,
                              :parameters => {'calendarId' => @cal_id,
                                'eventId' => gevent_id})
   # FIXME handle error case
@@ -386,7 +408,7 @@ end
       # gevent = exceptions[original_dates.index(orig_dt)]
       # gevent.delete('id')
       # @logger.info JSON.dump(gevent)
-      # result2 = client.execute(:api_method => service.events.patch
+      # result2 = @client.execute(:api_method => @service.events.patch
       #                          :parameters => {'calendarId' => @cal_id,
       #                            'eventId' => gitem['id']},
       #                          :body_object => JSON.dump(gevent),
@@ -395,7 +417,7 @@ end
       # 例外イベントの更新のためにまずGCから削除（あとで追加）
       @logger.info "Deleting instance ... "
       @logger.info "#{gitem["summary"]} on #{get_date(gitem)}"
-      result = client.execute(:api_method => service.events.delete,
+      result = @client.execute(:api_method => @service.events.delete,
                               :parameters => {'calendarId' => @cal_id, 
                                 'eventId' => gitem['id']})
       if result.response.body != "" then
@@ -420,10 +442,10 @@ end
 
     @logger.info "Adding instance ... "
     @logger.info "#{ievent_ex["summary"]} on #{get_date(ievent_ex)}"
-    result = client.execute(:api_method => service.events.insert,
-                            :parameters => {'calendarId' => @cal_id},
-                            :body => JSON.dump(ievent_ex),
-                            :headers => {'Content-Type' => 'application/json'})
+    result = @client.execute(:api_method => @service.events.insert,
+                             :parameters => {'calendarId' => @cal_id},
+                             :body => JSON.dump(ievent_ex),
+                             :headers => {'Content-Type' => 'application/json'})
     if JSON.parse(result.response.body).has_key?("error") then
       @logger.warn("Instance add failed.")
       @logger.warn(result.response.body)
