@@ -1,4 +1,4 @@
-#!/usr/bin/ruby
+#!/usr/local/bin/ruby
 # -*- coding: utf-8 -*-
 #
 # One way sync tool from iCalendar (ics file) to Google Calendar
@@ -29,10 +29,13 @@ require 'tzinfo'
 require 'icalendar'
 require 'icalendar/tzinfo'
 require 'base32'
-require 'google/api_client'
+
+require 'googleauth'
+require 'googleauth/stores/file_token_store'
+require 'google/apis/calendar_v3'
 require 'google/api_client/client_secrets'
-require 'google/api_client/auth/file_storage'
-require 'google/api_client/auth/installed_app'
+
+GEvent = Google::Apis::CalendarV3::Event
 
 @logger = Logger.new(STDOUT)
 @logger.level = Logger::INFO
@@ -59,6 +62,8 @@ opt.parse!(ARGV)
 
 if ARGV.length < 1
   abort "Need one .ics file in argments"
+else
+  ICSFILE = ARGV[0]
 end
 
 @logger.info("Program started")
@@ -74,10 +79,19 @@ Base32.table = 'abcdefghijklmnopqrstuv0123456789'.freeze
 
 ### util functions
 
-# get date/time string from a hash representing an Google event/item
-def get_date(gevent)
-  date = gevent["start"] || gevent["originalStartTime"]
-  return date["dateTime"] || date["date"]
+# @return [Google::Apis::CalendarV3::EventDateTime]
+def get_date(event)
+  if event.kind_of?(GEvent) then
+    return event.start || event.original_start_time
+  else
+    return event[:start] || event[:original_start_time]
+  end  
+end
+
+# @return String 
+def get_date_string(event)
+  dt = get_date(event)
+  return (dt.date_time || dt.date).to_s
 end
 
 # To fix timezone:
@@ -95,9 +109,9 @@ end
 class Icalendar::Event
   def fix_timezone!
     tzids = @dtstart.ical_params["tzid"]
-    return unless tzids # UTC の場合? 未検証
+    return unless tzids # UTC の場合を想定 (未検証!)
 
-    #FIXME tzids が複数の場合未検証
+    #TODO tzids が複数の場合未検証
     tzid = tzids.first
     offset = @parent.timezone_offset(tzid)
     if offset then
@@ -136,8 +150,6 @@ end
 
 # convert Date/DateTime object to a Hash object that represents date/time
 def datetime_hash(datetime, timezone)
-  hash = {}
-  #p datetime.class
   case datetime
   when DateTime, Icalendar::Values::DateTime
     return {"dateTime" => datetime.iso8601, "timeZone" => timezone}
@@ -148,10 +160,35 @@ def datetime_hash(datetime, timezone)
   end
 end 
 
+# @return Google::Apis::CalendarV3::EventDateTime
+def event_datetime(datetime, timezone)
+  hash = {}
+  #p datetime.class
+  case datetime
+  when DateTime, Icalendar::Values::DateTime
+    hash = {:date_time => datetime.iso8601, :time_zone => timezone}
+  when Date, Icalendar::Values::Date
+    hash = {:date => datetime.iso8601, :time_zone => timezone}
+  else 
+    raise "event_datetime class error"
+  end
+  return Google::Apis::CalendarV3::EventDateTime.new(**hash)
+end 
+
+def delete_event(event_id)
+  begin
+    @client.delete_event(@cal_id, event_id)
+  rescue Google::Apis::ClientError => e
+    @logger.warn "event delete failed."
+    @logger.warn e.messages
+    @logger.debug e
+  end
+end
+
 ### Read iCalendar (ics file)
-@logger.info("Loading ics file #{ARGV[0]} ...")
+@logger.info("Loading ics file #{ICSFILE} ...")
 icalendars = nil
-File.open(ARGV[0]){|f| icalendars = Icalendar::parse(f) }
+File.open(ICSFILE){|f| icalendars = Icalendar::parse(f) }
 
 # convert ics events to GCalendar events
 @events = {}
@@ -162,10 +199,11 @@ icalendars.first.events.each do |ievent|
   gevent_id = Base32.encode(ievent.uid).gsub(%r|=+|,'').downcase
   
   gevent = {}
-  gevent["id"]      = gevent_id
-  gevent["summary"] = ievent.summary
-  gevent["categories"] = ievent.categories.to_a
+  gevent[:id]      = gevent_id
+  gevent[:summary] = ievent.summary
+  gevent[:categories] = ievent.categories.to_a
 
+  
   #繰り返し予定
   if ievent.rrule != [] then
     recurrence = []
@@ -178,7 +216,7 @@ icalendars.first.events.each do |ievent|
       ievent.rdate.each{|e| recurrence << "RDATE:" + e.value_ical }
     end
     @logger.debug "Recurrence - " + recurrence.to_s
-    gevent["recurrence"] = recurrence
+    gevent[:recurrence] = recurrence
 
   end
 
@@ -186,17 +224,19 @@ icalendars.first.events.each do |ievent|
   #UIDが同じなので別の処理が必要
   #Google Calendar のインタフェースも異なる
   if ievent.recurrence_id then
-    gevent["recurrence_id"] = ievent.recurrence_id
-    gevent["summary"] ||= @events[gevent_id]["summary"]
+    gevent[:recurrence_id] = ievent.recurrence_id
+    gevent[:summary] ||= @events[gevent_id][:summary]
     
-    gevent["start"] = datetime_hash(ievent.dtstart, TimeZone)
-    gevent["end"]   = datetime_hash(ievent.dtend, TimeZone)
+#    gevent[:start] = datetime_hash(ievent.dtstart, TimeZone)
+#    gevent[:end]   = datetime_hash(ievent.dtend, TimeZone)
+    gevent[:start]   = event_datetime(ievent.dtstart, TimeZone)
+    gevent[:end]     = event_datetime(ievent.dtend, TimeZone)
     #gevent["start"]   ||= @events[gevent_id]["start"]
     #gevent["end"]     ||= @events[gevent_id]["end"]
     
     @logger.debug ievent.summary
     @logger.debug ievent.dtstart
-    @logger.debug gevent["start"]
+    @logger.debug gevent[:start]
 
     @recurrence_exceptions[gevent_id] ||= [] # nil の場合
     @recurrence_exceptions[gevent_id] << gevent
@@ -209,14 +249,16 @@ icalendars.first.events.each do |ievent|
     ievent.fix_timezone!
   end
   # TODO Google に TimeZone 渡さないといけないんだっけ? （そうだった気がするけど）
-  gevent["start"]   = datetime_hash(ievent.dtstart, TimeZone)
-  gevent["end"]     = datetime_hash(ievent.dtend, TimeZone)
+#  gevent[:start]   = datetime_hash(ievent.dtstart, TimeZone)
+#  gevent[:end]     = datetime_hash(ievent.dtend, TimeZone)
+  gevent[:start]   = event_datetime(ievent.dtstart, TimeZone)
+  gevent[:end]     = event_datetime(ievent.dtend, TimeZone)
 
   @events[gevent_id] = gevent
 
   @logger.debug ievent.summary
   @logger.debug ievent.dtstart
-  @logger.debug gevent["start"]
+  @logger.debug gevent[:start]
 end
 
 #exit   
@@ -224,43 +266,40 @@ end
 #TODO bulk update
 
 # Initialize the client.
-@client = Google::APIClient.new(
-  :application_name => 'ICS to Google Calendar',
-  :application_version => '0.1.0'
-)
-
 # OAuth2.0 auth and  cache 
-CREDENTIAL_STORE_FILE = "#{$0}-oauth2.json"
-file_storage = Google::APIClient::FileStorage.new(CREDENTIAL_STORE_FILE)
+OOB_URI = 'urn:ietf:wg:oauth:2.0:oob'
+CREDENTIAL_STORE_FILE = "#{$0}-tokens.yaml"
+scope = 'https://www.googleapis.com/auth/calendar'
 
-if file_storage.authorization.nil?
-  # Load client secrets from your client_secrets.json.
-  client_secrets = Google::APIClient::ClientSecrets.load
-  flow = Google::APIClient::InstalledAppFlow.new(
-                                                 :client_id => client_secrets.client_id,
-                                                 :client_secret => client_secrets.client_secret,
-                                                 :scope => ['https://www.googleapis.com/auth/calendar']
-                                                 )
-  
-  @client.authorization = flow.authorize(file_storage)
-else
-  @client.authorization = file_storage.authorization
-end
+client_id = Google::Auth::ClientId.from_file('./client_secrets.json')
+token_store = Google::Auth::Stores::FileTokenStore.new(
+  :file => CREDENTIAL_STORE_FILE)
+authorizer = Google::Auth::UserAuthorizer.new(client_id, scope, token_store)
 
+user_id = 'default'
+credentials = authorizer.get_credentials(user_id)
+if credentials.nil?
+  url = authorizer.get_authorization_url(base_url: OOB_URI )
+  puts "Open #{url} in your browser and enter the resulting code:"
+  code = STDIN.gets
+  credentials = authorizer.get_and_store_credentials_from_code(
+    user_id: user_id, code: code, base_url: OOB_URI)
+end  
 
 # Initialize Google API. Note this will make a request to the
 # discovery service every time, so be sure to use serialization
 # in your production code. Check the samples for more details.
-@service = @client.discovered_api('calendar', 'v3')
+@client = Google::Apis::CalendarV3::CalendarService.new
+@client.authorization = credentials
 
 #カレンダーリストの取得
-gcalendars = @client.execute(:api_method => @service.calendar_list.list)
+gcalendars = @client.list_calendar_lists
 
 @cal_id = nil
-gcalendars.data.items.each do |c|
-  @logger.debug c["id"]
-  if c["summary"] == @calendarName
-    @cal_id = c["id"]
+gcalendars.items.each do |c|
+  @logger.debug c.summary
+  if c.summary == @calendarName
+    @cal_id = c.id
     break
   end
 end
@@ -272,37 +311,36 @@ abort("Could not find Google Calendar: #{@calendarName}") if @cal_id.nil?
 day_from = DateTime.now - 365 # 一年前から
 day_to   = DateTime.now + 365 # 一年後まで
 
-params = {}
-params['calendarId'] = @cal_id
-params['timeMin'] = day_from.iso8601
-params['timeMax'] = day_to.iso8601
-@logger.debug params
-
 def gc_update(gevent, ievent)
   #GCカレンダーアイテムの更新
-  gevent_id = gevent['id']
-  gevent_summary = gevent["summary"]
-  @logger.info "Updating #{gevent_summary} on #{get_date(gevent)}"
+  gevent_id = gevent.id
+  gevent_summary = gevent.summary
+  @logger.info "Updating #{gevent_summary} on #{get_date_string(gevent)}"
   
-  result2 = @client.execute(:api_method => @service.events.patch,
-                            :parameters => {'calendarId' => @cal_id, 
-                                           'eventId' => gevent_id},
-                            :body => JSON.dump(ievent),
-                            :headers => {'Content-Type' => 'application/json'})
-  if JSON.parse(result2.response.body).has_key?("error") then
-    @logger.info result2.response.body
-    @logger.warn result2.request.body
+  ## TODO ievent から CalendarV3::Event に変換できてる？
+  @logger.debug ievent
+  gevent2 = @client.patch_event(@cal_id, gevent_id, GEvent.new(**ievent))
+  unless gevent2
+    @logger.warn "gc_update failed?"
   end
+  #                                :body => JSON.dump(ievent),
+  #                                :headers => {'Content-Type' => 'application/json'})
+  #  if JSON.parse(result2.response.body).has_key?("error") then
+  #    @logger.info result2.response.body
+  #    @logger.warn result2.request.body
+  #  end
 end
 
 # GCイベントをスキャン with Pagerization
-gevents = @client.execute(:api_method => @service.events.list,:parameters => params)
+gevents = @client.list_events(@cal_id, \
+                              time_min: day_from.iso8601, time_max: day_to.iso8601)
 while true
-  gevents.data.items.each do |gevent|
+#  gevents.data.items.each do |gevent|
+  gevents.items.each do |gevent|
     #gevent_id = gevent['iCalUID']
     #gevent_id = gevent_id ? gevent_id.gsub(/@google.com$/, "")  : gevent['id']
-    gevent_id = gevent['id']
-    gevent_summary = gevent["summary"]
+    gevent_id = gevent.id
+    gevent_summary = gevent.summary
 
     ievent = @events[gevent_id]
     if ievent then
@@ -310,26 +348,26 @@ while true
       # 現状、全部更新してる
       gc_update(gevent, ievent)
     else # gc と ics で id が一致しない（icsに無い）イベントはケースに応じて処理
-      @logger.warn gevent
-      if gevent['recurringEventId'] then
+      @logger.debug gevent
+      if gevent.recurring_event_id then ## 空のとき nil ？ TODO
         # 繰り返しイベントのインスタンスの場合はスキップ
-        @logger.info "Skipping Recurring event on #{get_date(gevent)} ..."
+        @logger.info "Skipping Recurring event on #{get_date_string(gevent)} ..."
       else 
         # そうでない場合は、icsから削除されたイベントか、別IDで登録さ
         # れた例外イベントなので、削除する（変更は追加で対応）
-        @logger.info "Deleting #{gevent_summary} on #{get_date(gevent)} ..."
-        @client.execute(:api_method => @service.events.delete,
-                       :parameters => {'calendarId' => @cal_id, 'eventId' => gevent_id})
+        @logger.info "Deleting #{gevent_summary} on #{get_date_string(gevent)} ..."
+        delete_event(gevent_id)
       end
     end
     #処理済みイベントをメモリから削除（後で追加しないように）
     @events.delete(gevent_id)
   end
-  if !(page_token = gevents.data.next_page_token)
+  if !(page_token = gevents.next_page_token)
     break
   end
-  params["pageToken"] = page_token
-  gevents = @client.execute(:api_method => @service.events.list,:parameters => params)
+  gevents = @client.list_events(@cal_id, \
+                                time_min: day_from.iso8601, time_max: day_to.iso8601, \
+                                page_token: page_token)
 end
 
 # Google Calendar に無かったイベントを追加
@@ -340,21 +378,22 @@ end
   @logger.debug "\n"
   @logger.info "Adding event ... "
   @logger.debug gevent_id
-  @logger.info "#{gevent["summary"]} on #{get_date(gevent)}"
+  @logger.info "#{gevent[:summary]} on #{get_date_string(gevent)}"
   
-  if gevent["categories"] & @excludeCategories != []  # 積集合が空じゃない
+  if gevent[:categories] & @excludeCategories != []  # 積集合が空じゃない
     @logger.info "skipped (reason: excluded category)"
     next
   end
 
-  result = @client.execute(:api_method => @service.events.insert,
-                          :parameters => {'calendarId' => @cal_id},
-                          :body => JSON.dump(gevent),
-                          :headers => {'Content-Type' => 'application/json'})
-
-  result_hash = JSON.parse(result.response.body)
-  if result_hash.has_key?("error") then
-    if (result_hash["error"]["errors"].first["reason"] == "duplicate") then
+  begin
+    @client.insert_event(@cal_id, GEvent.new(gevent))
+  #if result_hash.has_key?("error") then
+  rescue Google::Apis::ClientError => e
+    @logger.debug e.status_code
+    @logger.debug e.body
+    #if (result_hash["error"]["errors"].first["reason"] == "duplicate") then
+    result = JSON.parse(e.body)
+    if result["error"]["errors"][0]["reason"] == "duplicate" then
       # なんらかの理由で、イベントは削除されたが gc の id が残っている状態の場合
       @logger.warn "event duplicated (id = #{gevent_id})"
       @logger.debug gevent
@@ -362,13 +401,14 @@ end
 
       # しかたないので id を空にして新規追加する
       # TODO: これだと次回実行時にまた削除されて毎回追加になる
-      gevent.delete("id")
+      gevent.delete(:id)
       @logger.warn "Retry adding with null id"
       redo
     else
       @logger.warn("Event add failed.")
-      @logger.warn(result.response.body)
-      @logger.debug result.request
+      @logger.warn e.message
+      @logger.warn e.status_code
+      @logger.warn e.body
     end
   end
 end
@@ -380,7 +420,7 @@ end
   @logger.debug gevent_id
   @logger.debug exceptions
 
-  original_dates = exceptions.map{|i| i['recurrence_id']}
+  original_dates = exceptions.map{|i| i[:recurrence_id]}
   @logger.debug original_dates
 
   #exceptions.each{|e| p gevent["start"] ; p gevent["recurrence_id"]}
@@ -388,18 +428,17 @@ end
   
   #gc 個別イベント (gitem) のスキャン
   #これには例外だけで無く全てのイベントインスタンスが含まれる
-  result = @client.execute(:api_method => @service.events.instances,
-                             :parameters => {'calendarId' => @cal_id,
-                               'eventId' => gevent_id})
+  gc_items = @client.list_event_instances(@cal_id, gevent_id)
   # FIXME handle error case
-  gc_items = JSON.parse(result.body)["items"]
-  gc_items.each{|gitem|
+  #gc_items = JSON.parse(result.body)["items"]
+  gc_items.items.each{|gitem|
     # （方針） gitem の更新がなぜか上手くいかないため、gitemはGCから削
     # 除して、別のUIDのイベントとして登録する。
 
     #ToDo DateTime じゃなく Date のケースのテスト
-    orig_start = gitem["originalStartTime"]
-    orig_dt =  DateTime.iso8601(orig_start["dateTime"] || orig_start["date"])
+    orig_start = gitem.original_start_time
+    #orig_dt =  DateTime.iso8601(orig_start["dateTime"] || orig_start["date"])
+    orig_dt =  orig_start
     @logger.debug orig_dt
 
     # ics にも変更元がある gc 例外イベントの場合
@@ -416,18 +455,8 @@ end
 
       # 例外イベントの更新のためにまずGCから削除（あとで追加）
       @logger.info "Deleting instance ... "
-      @logger.info "#{gitem["summary"]} on #{get_date(gitem)}"
-      result = @client.execute(:api_method => @service.events.delete,
-                              :parameters => {'calendarId' => @cal_id, 
-                                'eventId' => gitem['id']})
-      if result.response.body != "" then
-        result_error = JSON.parse(result.response.body)["error"] 
-        if result_error then
-          @logger.warn("Instance delete failed.")
-          @logger.warn(result.response.body)
-          @logger.debug result.request
-        end
-      end
+      @logger.info "#{gitem[:summary]} on #{get_date_string(gitem)}"
+      delete_event(gitem[:id])
 
    else # ics に変更元がない gc 例外イベントの場合
      # keep it (do nothing)
@@ -436,20 +465,18 @@ end
 
   # icsの例外イベントをGCに新規イベントとして登録
   exceptions.each{|ievent_ex|
-    ievent_ex.delete('id') 
+    ievent_ex.delete(:id) 
     # TODO 現状 gitem は削除追加で更新しているが、IDの変換ルールを導入
     # すれば更新ですむかもしれない
 
     @logger.info "Adding instance ... "
-    @logger.info "#{ievent_ex["summary"]} on #{get_date(ievent_ex)}"
-    result = @client.execute(:api_method => @service.events.insert,
-                             :parameters => {'calendarId' => @cal_id},
-                             :body => JSON.dump(ievent_ex),
-                             :headers => {'Content-Type' => 'application/json'})
-    if JSON.parse(result.response.body).has_key?("error") then
+    @logger.info "#{ievent_ex[:summary]} on #{get_date_string(ievent_ex)}"
+    begin
+      @client.insert_event(@cal_id, GEvent.new(ievent_ex))
+    rescue Google::Apis::ClientError => e
       @logger.warn("Instance add failed.")
-      @logger.warn(result.response.body)
-      @logger.debug result.request
+      @logger.warn(e.body)
+      @logger.debug e
     end
   }
 end
