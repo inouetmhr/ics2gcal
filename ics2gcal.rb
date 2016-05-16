@@ -148,6 +148,16 @@ class Icalendar::Calendar
   end
 end
 
+class Google::Apis::CalendarV3::EventDateTime
+  def fix_date_or_time!
+    if @date_time
+      @date = nil
+    else
+      @date_time = nil
+    end
+  end
+end
+
 # convert Date/DateTime object to a Hash object that represents date/time
 def datetime_hash(datetime, timezone)
   case datetime
@@ -174,16 +184,6 @@ def event_datetime(datetime, timezone)
   end
   return Google::Apis::CalendarV3::EventDateTime.new(**hash)
 end 
-
-def delete_event(event_id)
-  begin
-    @client.delete_event(@cal_id, event_id)
-  rescue Google::Apis::ClientError => e
-    @logger.warn "event delete failed."
-    @logger.warn e.messages
-    @logger.debug e
-  end
-end
 
 ### Read iCalendar (ics file)
 @logger.info("Loading ics file #{ICSFILE} ...")
@@ -263,7 +263,7 @@ end
 
 #exit   
 ### Setup Google API
-#TODO bulk update
+#TODO batch adding for instances
 
 # Initialize the client.
 # OAuth2.0 auth and  cache 
@@ -305,110 +305,182 @@ gcalendars.items.each do |c|
 end
 
 abort("Could not find Google Calendar: #{@calendarName}") if @cal_id.nil?
-@logger.debug @cal_id
+@logger.info "Calendar id: #{@cal_id}"
 
 # Google Calendar 登録済みイベントのスキャン
 day_from = DateTime.now - 365 # 一年前から
 day_to   = DateTime.now + 365 # 一年後まで
 
-def gc_update(gevent, ievent)
+def gc_update_old(gevent, ievent)
   #GCカレンダーアイテムの更新
   gevent_id = gevent.id
   gevent_summary = gevent.summary
   @logger.info "Updating #{gevent_summary} on #{get_date_string(gevent)}"
-  
-  ## TODO ievent から CalendarV3::Event に変換できてる？
   @logger.debug ievent
   gevent2 = @client.patch_event(@cal_id, gevent_id, GEvent.new(**ievent))
   unless gevent2
     @logger.warn "gc_update failed?"
   end
-  #                                :body => JSON.dump(ievent),
-  #                                :headers => {'Content-Type' => 'application/json'})
-  #  if JSON.parse(result2.response.body).has_key?("error") then
-  #    @logger.info result2.response.body
-  #    @logger.warn result2.request.body
-  #  end
 end
 
-# GCイベントをスキャン with Pagerization
-gevents = @client.list_events(@cal_id, \
-                              time_min: day_from.iso8601, time_max: day_to.iso8601)
-while true
-#  gevents.data.items.each do |gevent|
-  gevents.items.each do |gevent|
-    #gevent_id = gevent['iCalUID']
-    #gevent_id = gevent_id ? gevent_id.gsub(/@google.com$/, "")  : gevent['id']
-    gevent_id = gevent.id
-    gevent_summary = gevent.summary
+def gc_update(gevent, ievent, client = @client)
+  #GCカレンダーアイテムの更新
+  @logger.info "Updating #{gevent.summary} on #{get_date_string(gevent)}"
+  @logger.debug ievent
+  client.patch_event(@cal_id, gevent.id, GEvent.new(**ievent)) do |res, err|
+    if err 
+      @logger.warn "Update failed."
+      @logger.warn err.message
+      @logger.warn err.body
+      @logger.debug err
+    end
+  end
+end
 
-    ievent = @events[gevent_id]
-    if ievent then
-      # gc の id が ics のid と一致したイベントは、更新する
-      # 現状、全部更新してる
-      gc_update(gevent, ievent)
-    else # gc と ics で id が一致しない（icsに無い）イベントはケースに応じて処理
-      @logger.debug gevent
-      if gevent.recurring_event_id then ## 空のとき nil ？ TODO
-        # 繰り返しイベントのインスタンスの場合はスキップ
-        @logger.info "Skipping Recurring event on #{get_date_string(gevent)} ..."
-      else 
-        # そうでない場合は、icsから削除されたイベントか、別IDで登録さ
-        # れた例外イベントなので、削除する（変更は追加で対応）
-        @logger.info "Deleting #{gevent_summary} on #{get_date_string(gevent)} ..."
-        delete_event(gevent_id)
+# 一度削除したものは戻せない update できないっぽい
+def gc_update_deleted(event_id, ievent, client = @client)
+  @logger.info "Undeleting #{ievent[:summary]} on #{get_date_string(ievent)}"
+  @logger.debug ievent
+  gevent = GEvent.new(ievent)
+  gevent.status = "confirmed"
+  gevent.start.fix_date_or_time!
+  gevent.end.fix_date_or_time!
+  client.update_event(@cal_id, event_id, gevent) do |res, err|
+    if err 
+      @logger.warn "Undelete failed."
+      @logger.warn err.message
+      @logger.warn err.body
+      @logger.debug err
+    end
+  end
+end
+
+def gc_delete(event_id, client = @client)
+  client.delete_event(@cal_id, event_id) do |res, err|
+    #rescue Google::Apis::ClientError => e
+    if err
+      @logger.warn "event delete failed."
+      @logger.warn err.message
+      @logger.debug err
+    end
+  end
+end
+
+#GCカレンダーアイテムのバッチ更新
+def gc_batch_update(queue)
+  return if queue == []
+  @client.batch do |calendar|
+    queue.each do |gevent, ievent|
+      @logger.info "Updating #{gevent.summary} on #{get_date_string(gevent)}"
+      @logger.debug ievent
+      calendar.patch_event(@cal_id, gevent.id, GEvent.new(**ievent))
+    end
+  end
+end
+
+def gc_batch_delete(queue)
+  return if queue == []
+  @client.batch do |calendar|
+    queue.each do |gevent|
+      @logger.info "Deleting #{gevent.summary} on #{get_date_string(gevent)}"
+      begin
+        calendar.delete_event(@cal_id, gevent.id) 
+      rescue Google::Apis::ClientError => e
+        @logger.warn "event delete failed."
+        @logger.warn e.message
+        @logger.debug e
       end
     end
-    #処理済みイベントをメモリから削除（後で追加しないように）
-    @events.delete(gevent_id)
   end
-  if !(page_token = gevents.next_page_token)
-    break
-  end
-  gevents = @client.list_events(@cal_id, \
-                                time_min: day_from.iso8601, time_max: day_to.iso8601, \
-                                page_token: page_token)
 end
 
-# Google Calendar に無かったイベントを追加
-@events.each do |gevent_id, gevent|
-  @logger.debug gevent_id
-  @logger.debug gevent
+# Google Calendar イベントをスキャン with Pagerization
+items = @client.fetch_all do |page_token|
+  @client.list_events(@cal_id,
+                      time_min: day_from.iso8601, time_max: day_to.iso8601,
+                      #single_events: true,
+                      #show_deleted: true,
+                      page_token: page_token)
+end
 
-  @logger.debug "\n"
-  @logger.info "Adding event ... "
-  @logger.debug gevent_id
-  @logger.info "#{gevent[:summary]} on #{get_date_string(gevent)}"
+update_batch_queue = []
+delete_batch_queue = []
+
+#@client.batch do |client| # 上手くいかない
+items.each do |gevent|
+  #gevent_id = gevent['iCalUID']
+  #gevent_id = gevent_id ? gevent_id.gsub(/@google.com$/, "")  : gevent['id']
   
-  if gevent[:categories] & @excludeCategories != []  # 積集合が空じゃない
-    @logger.info "skipped (reason: excluded category)"
-    next
+  ievent = @events[gevent.id]
+  if ievent then
+    # gc の id が ics のid と一致したイベントは、更新する
+    # 現状、全部更新してる
+    #gc_update(gevent, ievent, client)
+    update_batch_queue << [gevent, ievent]
+  else # gc と ics で id が一致しない（icsに無い）イベントはケースに応じて処理
+    @logger.debug gevent
+    if gevent.recurring_event_id then ## 空のとき nil ？ TODO
+      # 繰り返しイベントのインスタンスの場合はスキップ
+      @logger.info "Skipping Recurring event on #{get_date_string(gevent)} ..."
+    else 
+      # そうでない場合は、icsから削除されたイベントか、別IDで登録さ
+      # れた例外イベントなので、削除する（変更は追加で対応）
+      #@logger.info "Deleting #{gevent.summary} on #{get_date_string(gevent)} ..."
+      #gc_delete(gevent.id, client)
+      delete_batch_queue << gevent
+    end
   end
+  #処理済みイベントをメモリから削除（後で追加しないように）
+  @events.delete(gevent.id)
+end
 
-  begin
-    @client.insert_event(@cal_id, GEvent.new(gevent))
-  #if result_hash.has_key?("error") then
-  rescue Google::Apis::ClientError => e
-    @logger.debug e.status_code
-    @logger.debug e.body
-    #if (result_hash["error"]["errors"].first["reason"] == "duplicate") then
-    result = JSON.parse(e.body)
-    if result["error"]["errors"][0]["reason"] == "duplicate" then
-      # なんらかの理由で、イベントは削除されたが gc の id が残っている状態の場合
-      @logger.warn "event duplicated (id = #{gevent_id})"
-      @logger.debug gevent
-      # gc_update(gevent, gevent) #これだと更新は成功するが削除状態のままになる
+gc_batch_update(update_batch_queue)
+gc_batch_delete(delete_batch_queue)
 
-      # しかたないので id を空にして新規追加する
-      # TODO: これだと次回実行時にまた削除されて毎回追加になる
-      gevent.delete(:id)
-      @logger.warn "Retry adding with null id"
-      redo
-    else
-      @logger.warn("Event add failed.")
-      @logger.warn e.message
-      @logger.warn e.status_code
-      @logger.warn e.body
+# Google Calendar に無かったイベントを追加
+
+@client.batch do |calendar|
+  @events.each do |event_id, ievent|
+    summary = ievent[:summary]
+
+    @logger.debug event_id
+    @logger.debug ievent
+
+    @logger.debug "\n"
+    @logger.info "Adding event ... "
+    @logger.debug event_id
+    @logger.info "#{summary} on #{get_date_string(ievent)}"
+    
+    if ievent[:categories] & @excludeCategories != []  # 積集合が空じゃない
+      @logger.info "skipped (reason: excluded category)"
+      next
+    end
+
+    #begin
+    calendar.insert_event(@cal_id, GEvent.new(ievent)) do |res, err|
+      #rescue Google::Apis::ClientError => e
+      if err
+        @logger.debug err.status_code
+        @logger.debug err.body
+        result = JSON.parse(err.body)
+        if result["error"]["errors"].first["reason"] == "duplicate" then
+          # なんらかの理由で、イベントは削除されたが gc の id が残っている状態の場合
+          @logger.warn "event duplicated (id = #{event_id})"
+          @logger.debug ievent
+          #gc_update_deleted(event_id, ievent, calendar) #失敗する
+          # しかたないので id を空にして新規追加する
+          # TODO: これだと次回実行時にまた削除されて毎回追加になる
+          ievent.delete(:id)
+          @logger.warn "Retry adding with null id"
+          calendar.insert_event(@cal_id, GEvent.new(ievent))
+          #redo
+        else
+          @logger.warn("Event add failed.")
+          @logger.warn err.message
+          @logger.warn err.status_code
+          @logger.warn err.body
+        end
+      end
     end
   end
 end
@@ -456,7 +528,7 @@ end
       # 例外イベントの更新のためにまずGCから削除（あとで追加）
       @logger.info "Deleting instance ... "
       @logger.info "#{gitem[:summary]} on #{get_date_string(gitem)}"
-      delete_event(gitem[:id])
+      gc_delete(gitem[:id])
 
    else # ics に変更元がない gc 例外イベントの場合
      # keep it (do nothing)
