@@ -104,6 +104,11 @@ class Icalendar::Values::DateTime
   def fix_offset(offset)  # offset: e.g. Rational(9,24) 
     return (self - offset).new_offset(offset)
   end
+
+  # @return DateTime
+  def to_dt
+    value
+  end
 end
 
 class Icalendar::Event
@@ -193,7 +198,7 @@ end
 ### Read iCalendar (ics file)
 @logger.info("Loading ics file #{ICSFILE} ...")
 icalendars = nil
-File.open(ICSFILE){|f| icalendars = Icalendar::parse(f) }
+File.open(ICSFILE){|f| icalendars = Icalendar::Calendar.parse(f) }
 
 # convert ics events to GCalendar events
 @events = {}
@@ -207,8 +212,8 @@ icalendars.first.events.each do |ievent|
   event[:id]      = event_id
   event[:summary] = ievent.summary
   event[:categories] = ievent.categories.to_a
+  event[:last_modified] = ievent.last_modified.to_dt if ievent.last_modified
 
-  
   #繰り返し予定
   if ievent.rrule != [] then
     recurrence = []
@@ -426,9 +431,14 @@ items.each do |gevent|
   ievent = @events[gevent.id]
   if ievent then
     # gc の id が ics のid と一致したイベントは、更新する
-    # 現状、全部更新してる
+    # 現状、全部更新してる → これで Rate Limit Error 食らってるっぽい
     #gc_update(gevent, ievent, client)
-    update_batch_queue << [gevent, ievent]
+    @logger.debug gevent.updated
+    @logger.debug ievent[:last_modified]
+    @logger.warn ievent[:summary] unless ievent[:last_modified]
+    if ievent[:last_modified] && (gevent.updated < ievent[:last_modified])
+      update_batch_queue << [gevent, ievent]
+    end
   else # gc と ics で id が一致しない（icsに無い）イベントはケースに応じて処理
     @logger.debug gevent
     if false
